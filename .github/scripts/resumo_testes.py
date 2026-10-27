@@ -77,6 +77,14 @@ def main():
             f.write(texto + "\n")
     print(texto)
 
+    # Anotacoes visiveis na pagina da execucao e na API do GitHub
+    total_falhas = totais["falhas"] + totais["erros"]
+    print(f"::notice title=Testes da API (JUnit)::{totais['testes']} testes executados, "
+          f"{total_falhas} falhas, {totais['ignorados']} ignorados, em {totais['tempo']:.1f}s.")
+    if plsql:
+        aprovados = sum(1 for l in plsql if l.startswith("[OK]"))
+        print(f"::notice title=Testes do banco (PL/SQL)::{aprovados} de {len(plsql)} verificacoes aprovadas.")
+
 
 if __name__ == "__main__":
     main()
