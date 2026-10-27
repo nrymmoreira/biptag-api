@@ -1,0 +1,312 @@
+name: CI/CD BipTag API
+
+# Pipeline da Fase 7 (Smart HAS):
+#   1. build-test  : sobe um Oracle limpo, aplica os scripts do banco, roda os
+#                    testes PL/SQL e os testes da API (JUnit) contra esse banco.
+#   2. deploy      : publica a imagem Docker da API no GitHub Container Registry
+#                    e faz o deploy em um ambiente de homologacao com Oracle,
+#                    validando os endpoints com testes de fumaca.
+#   3. deploy-oracle-fiap (opcional, manual): aplica os packages e triggers no
+#                    Oracle da FIAP usando os secrets do repositorio.
+# Cada job publica os logs e relatorios como artefatos da execucao.
+
+on:
+  push:
+    branches: [main, fase-7-devops]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      aplicar_oracle_fiap:
+        description: "Aplicar os scripts 06 e 07 no Oracle da FIAP (exige os secrets FIAP_DB_*)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ORACLE_IMAGE: gvenzl/oracle-xe:21-slim-faststart
+  ORACLE_ADMIN_PASSWORD: BipTagAdmin2026
+  ORACLE_APP_USER: biptag
+  ORACLE_APP_PASSWORD: BipTagCi2026
+  JAVA_VERSION: "17"
+
+jobs:
+  build-test:
+    name: Build, banco Oracle e testes
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Baixar o codigo
+        uses: actions/checkout@v4
+
+      - name: Configurar Java ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Subir Oracle Database XE em container
+        run: |
+          docker run -d --name oracle -p 1521:1521 \
+            -e ORACLE_PASSWORD="$ORACLE_ADMIN_PASSWORD" \
+            -e APP_USER="$ORACLE_APP_USER" \
+            -e APP_USER_PASSWORD="$ORACLE_APP_PASSWORD" \
+            "$ORACLE_IMAGE"
+
+      - name: Aguardar o banco ficar pronto
+        run: |
+          for tentativa in $(seq 1 60); do
+            if docker logs oracle 2>&1 | grep -q "DATABASE IS READY TO USE"; then
+              echo "Oracle pronto apos $((tentativa * 5)) segundos."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::O Oracle nao ficou pronto a tempo."
+          docker logs oracle
+          exit 1
+
+      - name: Deploy do banco (tabelas, dados, packages e triggers)
+        run: |
+          mkdir -p relatorios/banco
+          docker cp database oracle:/tmp/database
+          docker exec oracle bash /tmp/database/deploy_db.sh \
+            "$ORACLE_APP_USER/$ORACLE_APP_PASSWORD@//localhost:1521/XEPDB1" \
+            /tmp/logs-banco \
+            /tmp/database/01_ddl_oracle.sql \
+            /tmp/database/02_dados_simulados.sql \
+            /tmp/database/06_packages.sql \
+            /tmp/database/07_triggers.sql
+
+      - name: Testes do banco (PL/SQL)
+        run: |
+          docker exec oracle bash /tmp/database/deploy_db.sh \
+            "$ORACLE_APP_USER/$ORACLE_APP_PASSWORD@//localhost:1521/XEPDB1" \
+            /tmp/logs-banco \
+            /tmp/database/08_testes_plsql.sql
+
+      - name: Build e testes da API (Maven + JUnit contra o Oracle)
+        working-directory: biptag-api
+        env:
+          DB_URL: jdbc:oracle:thin:@//localhost:1521/XEPDB1
+          DB_USERNAME: ${{ env.ORACLE_APP_USER }}
+          DB_PASSWORD: ${{ env.ORACLE_APP_PASSWORD }}
+          LOG_LEVEL_SECURITY: INFO
+          LOG_LEVEL_WEB: INFO
+        run: |
+          set -o pipefail
+          chmod +x mvnw
+          ./mvnw -B -ntp verify 2>&1 | tee ../relatorios/maven-build.log
+
+      - name: Gerar relatorio da execucao
+        if: always()
+        run: |
+          docker cp oracle:/tmp/logs-banco/. relatorios/banco/ || true
+          python3 .github/scripts/resumo_testes.py \
+            biptag-api/target/surefire-reports \
+            relatorios/banco/08_testes_plsql.log \
+            relatorios/RESUMO.md
+
+      - name: Publicar logs e relatorios
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: relatorios-build-test
+          path: |
+            relatorios/
+            biptag-api/target/surefire-reports/
+          retention-days: 30
+
+      - name: Guardar o .jar para o deploy
+        uses: actions/upload-artifact@v4
+        with:
+          name: biptag-api-jar
+          path: biptag-api/target/biptag-api-*.jar
+          retention-days: 7
+
+  deploy:
+    name: Deploy (imagem Docker + homologacao com Oracle)
+    needs: build-test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Baixar o codigo
+        uses: actions/checkout@v4
+
+      - name: Baixar o .jar gerado no build
+        uses: actions/download-artifact@v4
+        with:
+          name: biptag-api-jar
+          path: biptag-api/target
+
+      - name: Definir nome e versao da imagem
+        run: |
+          DONO="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "IMAGEM=ghcr.io/$DONO/biptag-api" >> "$GITHUB_ENV"
+          echo "VERSAO=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+
+      - name: Login no GitHub Container Registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build e publicacao da imagem
+        run: |
+          docker build \
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            -t "$IMAGEM:$VERSAO" -t "$IMAGEM:latest" biptag-api
+          docker push "$IMAGEM:$VERSAO"
+          docker push "$IMAGEM:latest"
+          echo "Imagem publicada: $IMAGEM:$VERSAO"
+
+      - name: Subir Oracle do ambiente de homologacao
+        run: |
+          docker run -d --name oracle -p 1521:1521 \
+            -e ORACLE_PASSWORD="$ORACLE_ADMIN_PASSWORD" \
+            -e APP_USER="$ORACLE_APP_USER" \
+            -e APP_USER_PASSWORD="$ORACLE_APP_PASSWORD" \
+            "$ORACLE_IMAGE"
+          for tentativa in $(seq 1 60); do
+            if docker logs oracle 2>&1 | grep -q "DATABASE IS READY TO USE"; then exit 0; fi
+            sleep 5
+          done
+          docker logs oracle
+          exit 1
+
+      - name: Deploy do banco de homologacao
+        run: |
+          docker cp database oracle:/tmp/database
+          docker exec oracle bash /tmp/database/deploy_db.sh \
+            "$ORACLE_APP_USER/$ORACLE_APP_PASSWORD@//localhost:1521/XEPDB1" \
+            /tmp/logs-banco \
+            /tmp/database/01_ddl_oracle.sql \
+            /tmp/database/02_dados_simulados.sql \
+            /tmp/database/06_packages.sql \
+            /tmp/database/07_triggers.sql
+
+      - name: Deploy da API em homologacao (imagem publicada)
+        run: |
+          docker run -d --name biptag-api --network host \
+            -e DB_URL="jdbc:oracle:thin:@//localhost:1521/XEPDB1" \
+            -e DB_USERNAME="$ORACLE_APP_USER" \
+            -e DB_PASSWORD="$ORACLE_APP_PASSWORD" \
+            -e LOG_LEVEL_SECURITY=INFO \
+            -e LOG_LEVEL_WEB=INFO \
+            "$IMAGEM:$VERSAO"
+          for tentativa in $(seq 1 40); do
+            if curl -sf http://localhost:8080/v3/api-docs > /dev/null; then
+              echo "API no ar apos $((tentativa * 3)) segundos."
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "::error::A API nao respondeu no ambiente de homologacao."
+          docker logs biptag-api
+          exit 1
+
+      - name: Testes de fumaca nos endpoints
+        run: |
+          mkdir -p relatorios
+          {
+            echo "## Deploy em homologação"
+            echo ""
+            echo "Imagem: \`$IMAGEM:$VERSAO\`"
+            echo ""
+            echo "| Verificação | Resultado |"
+            echo "|---|---|"
+          } > relatorios/DEPLOY.md
+
+          falhas=0
+          verificar() {
+            local descricao="$1" metodo="$2" url="$3" esperado="$4"
+            local codigo
+            codigo=$(curl -s -o /dev/null -w "%{http_code}" -X "$metodo" -H "Content-Type: application/json" "$url")
+            if [ "$codigo" = "$esperado" ]; then
+              echo "| $descricao | HTTP $codigo (OK) |" >> relatorios/DEPLOY.md
+            else
+              echo "| $descricao | HTTP $codigo, esperado $esperado (FALHA) |" >> relatorios/DEPLOY.md
+              falhas=$((falhas + 1))
+            fi
+          }
+
+          verificar "Documentação OpenAPI" GET  http://localhost:8080/v3/api-docs 200
+          verificar "Listar categorias (Oracle)" GET  http://localhost:8080/api/v1/categories 200
+          verificar "Listar itens (Oracle)" GET  http://localhost:8080/api/v1/items 200
+          verificar "Listar pontos parceiros (Oracle)" GET  http://localhost:8080/api/v1/partner-points 200
+          verificar "Escrita sem token bloqueada" POST http://localhost:8080/api/v1/items 401
+
+          curl -s http://localhost:8080/api/v1/categories > relatorios/resposta-categorias.json
+          cat relatorios/DEPLOY.md
+          cat relatorios/DEPLOY.md >> "$GITHUB_STEP_SUMMARY"
+          [ "$falhas" -eq 0 ]
+
+      - name: Coletar logs do deploy
+        if: always()
+        run: |
+          mkdir -p relatorios/banco
+          docker logs biptag-api > relatorios/api-homologacao.log 2>&1 || true
+          docker cp oracle:/tmp/logs-banco/. relatorios/banco/ || true
+
+      - name: Publicar logs do deploy
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: relatorios-deploy
+          path: relatorios/
+          retention-days: 30
+
+  deploy-oracle-fiap:
+    name: Deploy dos objetos PL/SQL no Oracle da FIAP (manual)
+    needs: build-test
+    if: github.event_name == 'workflow_dispatch' && inputs.aplicar_oracle_fiap
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Baixar o codigo
+        uses: actions/checkout@v4
+
+      - name: Verificar secrets
+        env:
+          FIAP_DB_USER: ${{ secrets.FIAP_DB_USER }}
+          FIAP_DB_PASSWORD: ${{ secrets.FIAP_DB_PASSWORD }}
+          FIAP_DB_CONNECT: ${{ secrets.FIAP_DB_CONNECT }}
+        run: |
+          if [ -z "$FIAP_DB_USER" ] || [ -z "$FIAP_DB_PASSWORD" ] || [ -z "$FIAP_DB_CONNECT" ]; then
+            echo "::error::Cadastre os secrets FIAP_DB_USER, FIAP_DB_PASSWORD e FIAP_DB_CONNECT (ex.: //oracle.fiap.com.br:1521/ORCL)."
+            exit 1
+          fi
+
+      - name: Aplicar packages e triggers
+        env:
+          FIAP_DB_USER: ${{ secrets.FIAP_DB_USER }}
+          FIAP_DB_PASSWORD: ${{ secrets.FIAP_DB_PASSWORD }}
+          FIAP_DB_CONNECT: ${{ secrets.FIAP_DB_CONNECT }}
+        run: |
+          mkdir -p relatorios
+          chmod 777 relatorios
+          docker run --rm --entrypoint bash \
+            -v "$PWD/database:/db:ro" -v "$PWD/relatorios:/relatorios" \
+            -e CONEXAO="$FIAP_DB_USER/$FIAP_DB_PASSWORD@$FIAP_DB_CONNECT" \
+            "$ORACLE_IMAGE" \
+            -c 'bash /db/deploy_db.sh "$CONEXAO" /relatorios /db/06_packages.sql /db/07_triggers.sql'
+
+      - name: Publicar logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: relatorios-oracle-fiap
+          path: relatorios/
+          retention-days: 30
