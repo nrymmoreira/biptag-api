@@ -117,7 +117,7 @@ jobs:
 
       - name: Publicar logs e relatorios
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: relatorios-build-test
           path: |
@@ -126,7 +126,7 @@ jobs:
           retention-days: 30
 
       - name: Guardar o .jar para o deploy
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: biptag-api-jar
           path: biptag-api/target/biptag-api-*.jar
@@ -147,7 +147,7 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Baixar o .jar gerado no build
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v7
         with:
           name: biptag-api-jar
           path: biptag-api/target
@@ -262,7 +262,7 @@ jobs:
 
       - name: Publicar logs do deploy
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: relatorios-deploy
           path: relatorios/
@@ -306,7 +306,7 @@ jobs:
 
       - name: Publicar logs
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: relatorios-oracle-fiap
           path: relatorios/
