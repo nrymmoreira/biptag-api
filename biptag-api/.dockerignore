@@ -1,0 +1,3 @@
+# Somente o .jar final entra na imagem
+*
+!target/biptag-api-*.jar
